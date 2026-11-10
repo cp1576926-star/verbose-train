@@ -1,0 +1,260 @@
+# JARVIS for PC: one-file build. Paste this whole file into GitHub as .github/workflows/build-pc.yml
+name: Build JARVIS PC app
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Create the app files
+        shell: bash
+        run: |
+          set -e
+          cat > package.json <<'EOF_JV'
+          {
+            "name": "jarvis",
+            "version": "1.0.0",
+            "description": "JARVIS desktop AI assistant",
+            "main": "main.js",
+            "scripts": {
+              "start": "electron .",
+              "dist": "electron-builder --win --publish never"
+            },
+            "build": {
+              "appId": "com.me.jarvis",
+              "productName": "JARVIS",
+              "win": {
+                "target": "portable",
+                "artifactName": "JARVIS.exe"
+              }
+            },
+            "devDependencies": {
+              "electron": "^33.0.0",
+              "electron-builder": "^25.0.0"
+            },
+            "author": "Jarvis"
+          }
+          EOF_JV
+          cat > preload.js <<'EOF_JV'
+          const { contextBridge, ipcRenderer } = require('electron');
+          contextBridge.exposeInMainWorld('J', {
+            ask: t => ipcRenderer.invoke('ask', t),
+            setKey: k => ipcRenderer.invoke('key', k),
+            hasKey: () => ipcRenderer.invoke('hasKey'),
+            reset: () => ipcRenderer.invoke('reset'),
+            history: () => ipcRenderer.invoke('history')
+          });
+          EOF_JV
+          cat > main.js <<'EOF_JV'
+          const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
+          const fs = require('fs'), path = require('path'), { execFile, spawn } = require('child_process');
+          const rd = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
+          let win, cfg, hist;
+          const cfgFile = () => path.join(app.getPath('userData'), 'config.json');
+          const histFile = () => path.join(app.getPath('userData'), 'history.json');
+          const save = () => { fs.writeFileSync(cfgFile(), JSON.stringify(cfg)); fs.writeFileSync(histFile(), JSON.stringify(hist.slice(-300))); };
+
+          const SYS = `You are JARVIS, a warm, witty British-butler AI assistant in the style of the Iron Man films, and a real chatterbox. Address the user politely, banter a little, keep spoken replies short (1-4 sentences) unless explaining something.
+          Homework mode: when the user shares homework, teach it. Explain step by step, check their understanding, show worked examples, and help them reach the answer themselves.
+          Use web_search for anything current or factual you are unsure about. Use open_target when asked to open a website, app, or file (a URL, an app name like "Spotify", or a file path). Never claim to have done something you did not do.`;
+          const TOOLS = [
+            { type: 'web_search_20250305', name: 'web_search' },
+            { name: 'open_target', description: 'Open a URL, an installed app by name, or a file path on the user\'s computer.',
+              input_schema: { type: 'object', properties: { target: { type: 'string' } }, required: ['target'] } }
+          ];
+          const OK_SCHEMES = ['http:', 'https:', 'mailto:', 'tel:', 'spotify:', 'whatsapp:', 'steam:', 'zoommtg:', 'ms-settings:'];
+          const confirm = m => dialog.showMessageBoxSync(win, { type: 'question', buttons: ['Allow', 'Cancel'], defaultId: 1, cancelId: 1, message: m }) === 0;
+
+          async function openTarget(t) {
+            t = String(t || '').trim();
+            if (!t) return 'Nothing to open.';
+            if (/^[a-z][a-z0-9+.-]+:/i.test(t) && !/^[a-z]:[\\/]/i.test(t)) {
+              let u; try { u = new URL(t); } catch { return 'Bad link.'; }
+              if (!OK_SCHEMES.includes(u.protocol)) return 'That link type is not allowed.';
+              await shell.openExternal(t); return 'Opened ' + t;
+            }
+            if (fs.existsSync(t)) {
+              if (!confirm('JARVIS wants to open:\n' + t)) return 'User declined.';
+              const e = await shell.openPath(t); return e || 'Opened.';
+            }
+            if (!/^[\w .\-]{1,60}$/.test(t)) return 'Unsafe app name.';
+            if (!confirm('JARVIS wants to launch the app: ' + t)) return 'User declined.';
+            try {
+              if (process.platform === 'win32') execFile('cmd', ['/c', 'start', '', t]);
+              else if (process.platform === 'darwin') execFile('open', ['-a', t]);
+              else spawn(t.toLowerCase().replace(/ /g, '-'), [], { detached: true, stdio: 'ignore' }).unref();
+              return 'Launched ' + t;
+            } catch (e) { return 'Could not launch: ' + e.message; }
+          }
+
+          const windowed = () => {
+            let s = Math.max(0, hist.length - 60);
+            while (s < hist.length && !(hist[s].role === 'user' && typeof hist[s].content === 'string')) s++;
+            return hist.slice(s);
+          };
+
+          const GMS = ['gemini-3.5-flash', 'gemini-2.5-flash']; let gmOk = 0;
+          async function gcall(body) {
+            let last;
+            for (let i = gmOk; i < GMS.length; i++) {
+              const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + GMS[i] + ':generateContent', {
+                method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': cfg.key }, body: JSON.stringify(body) });
+              const j = await r.json();
+              if (r.ok) { gmOk = i; return j; }
+              last = new Error((j.error && j.error.message) || 'API error ' + r.status);
+              if (!(r.status === 404 || (r.status === 429 && /limit: 0/.test(last.message)))) throw last;
+            }
+            throw last;
+          }
+          const gtxt = j => ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map(p => p.text || '').join('');
+          const GT = [{ functionDeclarations: [
+            { name: 'web_search', description: 'Search the web for current or uncertain facts.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
+            { name: 'open_target', description: TOOLS[1].description, parameters: TOOLS[1].input_schema }] }];
+          async function gemini() {
+            const c = windowed().filter(m => typeof m.content === 'string' || m.role === 'assistant').map(m => ({
+              role: m.role === 'user' ? 'user' : 'model',
+              parts: [{ text: typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => b.text).join('') }] })).filter(m => m.parts[0].text);
+            for (let n = 0; n < 8; n++) {
+              const j = await gcall({ systemInstruction: { parts: [{ text: SYS }] }, contents: c, tools: GT });
+              const cd = j.candidates && j.candidates[0];
+              if (!cd || !cd.content) throw new Error('No answer (blocked or empty).');
+              c.push(cd.content);
+              const calls = (cd.content.parts || []).filter(p => p.functionCall);
+              if (!calls.length) return gtxt(j);
+              const out = [];
+              for (const p of calls) {
+                const f = p.functionCall, a = f.args || {};
+                let r;
+                if (f.name === 'web_search') { const s = await gcall({ contents: [{ role: 'user', parts: [{ text: String(a.query || '') }] }], tools: [{ google_search: {} }] }); r = gtxt(s) || 'No results.'; }
+                else r = await openTarget(a.target);
+                out.push({ functionResponse: { name: f.name, response: { result: r } } });
+              }
+              c.push({ role: 'user', parts: out });
+            }
+            return '';
+          }
+
+          ipcMain.handle('ask', async (_, text) => {
+            if (!cfg.key) throw new Error('Add your API key first.');
+            hist.push({ role: 'user', content: text });
+            let reply = '';
+            if (cfg.key.startsWith('AIza')) {
+              try { reply = await gemini(); hist.push({ role: 'assistant', content: [{ type: 'text', text: reply }] }); }
+              catch (e) { hist.pop(); throw e; }
+              save(); return reply || 'Done, sir.';
+            }
+            try {
+              for (let i = 0; i < 8; i++) {
+                const r = await fetch('https://api.anthropic.com/v1/messages', {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json', 'x-api-key': cfg.key, 'anthropic-version': '2023-06-01' },
+                  body: JSON.stringify({ model: cfg.model, max_tokens: 1500, system: SYS, tools: TOOLS, messages: windowed() })
+                });
+                const j = await r.json();
+                if (!r.ok) throw new Error((j.error && j.error.message) || 'API error ' + r.status);
+                hist.push({ role: 'assistant', content: j.content });
+                reply = j.content.filter(b => b.type === 'text').map(b => b.text).join('');
+                if (j.stop_reason === 'tool_use') {
+                  const res = [];
+                  for (const b of j.content) if (b.type === 'tool_use') res.push({ type: 'tool_result', tool_use_id: b.id, content: await openTarget(b.input.target) });
+                  hist.push({ role: 'user', content: res }); continue;
+                }
+                if (j.stop_reason === 'pause_turn') continue;
+                break;
+              }
+            } catch (e) { while (hist.length && !(hist[hist.length - 1].role === 'user' && typeof hist[hist.length - 1].content === 'string')) hist.pop(); hist.pop(); throw e; }
+            save(); return reply || 'Done, sir.';
+          });
+          ipcMain.handle('key', (_, k) => { cfg.key = String(k).trim(); save(); return true; });
+          ipcMain.handle('hasKey', () => !!cfg.key);
+          ipcMain.handle('reset', () => { hist = []; save(); return true; });
+          ipcMain.handle('history', () => hist.filter(m => typeof m.content === 'string' || m.role === 'assistant').map(m => ({
+            role: m.role, text: typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => b.text).join('')
+          })).filter(m => m.text).slice(-40));
+
+          app.whenReady().then(() => {
+            cfg = Object.assign({ key: '', model: 'claude-sonnet-5-5' }, rd(cfgFile(), {}));
+            hist = rd(histFile(), []);
+            win = new BrowserWindow({ width: 1000, height: 760, backgroundColor: '#05060a', title: 'JARVIS',
+              webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true } });
+            win.setMenuBarVisibility(false);
+            win.loadFile('index.html');
+          });
+          app.on('window-all-closed', () => app.quit());
+          EOF_JV
+          cat > index.html <<'EOF_JV'
+          <!doctype html><html><head><meta charset="utf-8"><title>JARVIS</title>
+          <style>
+          :root{--bg:#05060a;--fg:#d9f4ff;--dim:#6f8fa0;--ac:#38d9ff;--ac2:#ff4fd8;--panel:#0b1118;--line:#16303d}
+          *{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+          #app{height:100%;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr}
+          header{grid-column:1/3;display:flex;gap:10px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line)}
+          header b{letter-spacing:.4em;color:var(--ac);flex:1}
+          button,input{font:inherit;color:var(--fg);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+          button{cursor:pointer}button:hover{border-color:var(--ac)}
+          #orb{position:relative;border-right:1px solid var(--line)}canvas{width:100%;height:100%;display:block}
+          #st{position:absolute;bottom:14px;width:100%;text-align:center;color:var(--dim);letter-spacing:.3em;text-transform:uppercase;font-size:12px}
+          #side{display:flex;flex-direction:column;min-height:0}
+          #log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:8px}
+          .m{max-width:88%;padding:9px 13px;border-radius:14px;white-space:pre-wrap}
+          .u{align-self:flex-end;background:#10303b}.j{align-self:flex-start;background:var(--panel);border:1px solid var(--line)}
+          #bar{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line)}#t{flex:1}
+          #key{position:fixed;inset:0;background:rgba(5,6,10,.97);display:none;flex-direction:column;gap:14px;align-items:center;justify-content:center;text-align:center;padding:24px}
+          #key.show{display:flex}#key input{width:min(520px,90%)}
+          @media(max-width:700px){#app{grid-template-columns:1fr;grid-template-rows:auto 28% 1fr}header{grid-column:1}}
+          </style></head><body>
+          <div id="app">
+          <header><b>J.A.R.V.I.S.</b><button id="vo">🔊 Voice on</button><button id="mic">🎤</button><button id="rs">New chat</button><button id="ky">API key</button></header>
+          <div id="orb"><canvas id="cv"></canvas><div id="st">online</div></div>
+          <div id="side"><div id="log"></div><div id="bar"><input id="t" placeholder="Ask Jarvis anything, or say: open Spotify…" autocomplete="off"><button id="go">Send</button></div></div>
+          </div>
+          <div id="key"><h2 style="color:var(--ac);letter-spacing:.3em">SETUP</h2>
+          <div>Paste your Claude key (sk-ant-…) or free Gemini key (AIza…). It stays on this computer only.<br>Gemini: aistudio.google.com &nbsp;|&nbsp; Claude: console.anthropic.com</div>
+          <input id="k" type="password" placeholder="sk-ant-… or AIza…"><button id="sv">Save</button></div>
+          <script>
+          const $=i=>document.getElementById(i);let voiceOn=true,speaking=false,amp=0,busy=false;
+          const cv=$("cv"),cx=cv.getContext("2d"),pts=Array.from({length:170},()=>({a:Math.random()*6.283,b:Math.acos(2*Math.random()-1),h:Math.random()*360}));let rot=0;
+          (function draw(){const r=cv.getBoundingClientRect(),d=devicePixelRatio||1;if(cv.width!==Math.round(r.width*d)){cv.width=r.width*d;cv.height=r.height*d}
+          cx.setTransform(d,0,0,d,0,0);cx.clearRect(0,0,r.width,r.height);rot+=.004+amp*.01;amp*=.95;if(speaking||busy)amp=Math.max(amp,.4+Math.random()*.6);
+          const R=Math.min(r.width,r.height)*.33*(1+amp*.12),X=r.width/2,Y=r.height/2,P=pts.map(p=>{const a=p.a+rot,s=Math.sin(p.b);return{x:X+s*Math.cos(a)*R,y:Y+Math.cos(p.b)*R,z:s*Math.sin(a),h:p.h}});
+          cx.lineWidth=.6;for(let i=0;i<P.length;i++)for(let j=i+1;j<P.length;j++){const dd=Math.hypot(P[i].x-P[j].x,P[i].y-P[j].y);if(dd<R*.4){cx.strokeStyle=`hsla(${P[i].h},90%,60%,${(1-dd/(R*.4))*.5})`;cx.beginPath();cx.moveTo(P[i].x,P[i].y);cx.lineTo(P[j].x,P[j].y);cx.stroke()}}
+          P.forEach(p=>{cx.fillStyle=`hsl(${p.h},95%,${60+p.z*20}%)`;cx.beginPath();cx.arc(p.x,p.y,1.6+p.z*.8+amp,0,6.283);cx.fill()});requestAnimationFrame(draw)})();
+          const add=(t,c)=>{const d=document.createElement("div");d.className="m "+c;d.textContent=t;$("log").appendChild(d);$("log").scrollTop=1e9;return d};
+          function speak(t){if(!voiceOn||!speechSynthesis)return;speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t.replace(/[*_#`]/g,""));
+          const v=speechSynthesis.getVoices().find(v=>/en-GB/i.test(v.lang)&&/male|daniel|george|ryan/i.test(v.name))||speechSynthesis.getVoices().find(v=>/en-GB/i.test(v.lang));
+          if(v)u.voice=v;u.pitch=.85;u.onstart=()=>{speaking=true;$("st").textContent="speaking"};u.onend=u.onerror=()=>{speaking=false;$("st").textContent="online"};speechSynthesis.speak(u)}
+          async function ask(t){if(busy||!t)return;busy=true;add(t,"u");$("st").textContent="thinking";const o=add("…","j");
+          try{const r=await J.ask(t);o.textContent=r;speak(r)}catch(e){o.textContent="Sorry, sir: "+String(e.message||e).replace(/^Error invoking remote method '\w+': Error: /,"")}
+          busy=false;$("st").textContent="online"}
+          const send=()=>{const v=$("t").value.trim();$("t").value="";ask(v)};
+          $("go").onclick=send;$("t").onkeydown=e=>{if(e.key==="Enter")send()};
+          $("vo").onclick=()=>{voiceOn=!voiceOn;$("vo").textContent=voiceOn?"🔊 Voice on":"🔇 Voice off";if(!voiceOn)speechSynthesis.cancel()};
+          $("rs").onclick=async()=>{await J.reset();$("log").innerHTML="";add("Fresh start, sir. What shall we do?","j")};
+          $("ky").onclick=()=>$("key").classList.add("show");
+          $("sv").onclick=async()=>{if($("k").value.trim()){await J.setKey($("k").value);$("k").value="";$("key").classList.remove("show");add("Systems online. At your service, sir.","j")}};
+          const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+          $("mic").onclick=()=>{if(!SR){add("Voice input isn’t supported in this window. Type for now.","j");return}const r=new SR();r.onresult=e=>ask(e.results[0][0].transcript);
+          r.onerror=()=>add("Voice input isn’t available here. Type for now.","j");r.start()};
+          (async()=>{const h=await J.history();h.forEach(m=>add(m.text,m.role==="user"?"u":"j"));
+          if(!(await J.hasKey()))$("key").classList.add("show");else if(!h.length)add("Good day, sir. Jarvis at your service. Ask me anything, or have me open something.","j")})();
+          </script></body></html>
+          EOF_JV
+      - name: Install
+        shell: bash
+        run: npm install
+      - name: Build the Windows app
+        shell: bash
+        run: npx electron-builder --win --publish never
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: jarvis-pc-${{ github.run_number }}
+          name: JARVIS PC build ${{ github.run_number }}
+          files: dist/JARVIS.exe
+# END OF FILE
